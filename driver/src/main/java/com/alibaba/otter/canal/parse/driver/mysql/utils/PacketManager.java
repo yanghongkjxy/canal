@@ -14,21 +14,21 @@ public abstract class PacketManager {
     }
 
     public static HeaderPacket readHeader(SocketChannel ch, int len, int timeout) throws IOException {
-    	HeaderPacket header = new HeaderPacket();
-    	header.fromBytes(ch.read(len, timeout));
-    	return header;
+        HeaderPacket header = new HeaderPacket();
+        header.fromBytes(ch.read(len, timeout));
+        return header;
     }
 
     public static byte[] readBytes(SocketChannel ch, int len) throws IOException {
         return ch.read(len);
     }
-    
+
     public static byte[] readBytes(SocketChannel ch, int len, int timeout) throws IOException {
         return ch.read(len, timeout);
     }
 
     public static void writePkg(SocketChannel ch, byte[]... srcs) throws IOException {
-        ch.writeChannel(srcs);
+        ch.write(srcs);
     }
 
     public static void writeBody(SocketChannel ch, byte[] body) throws IOException {
@@ -39,6 +39,6 @@ public abstract class PacketManager {
         HeaderPacket header = new HeaderPacket();
         header.setPacketBodyLength(body.length);
         header.setPacketSequenceNumber(packetSeqNumber);
-        ch.writeChannel(header.toBytes(), body);
+        ch.write(header.toBytes(), body);
     }
 }

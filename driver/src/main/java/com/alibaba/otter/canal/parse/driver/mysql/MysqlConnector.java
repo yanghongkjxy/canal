@@ -32,7 +32,7 @@ public class MysqlConnector {
     private String              password;
 
     private byte                charsetNumber     = 33;
-    private String              defaultSchema     = "retl";
+    private String              defaultSchema     = "test";
     private int                 soTimeout         = 30 * 1000;
     private int                 connTimeout       = 5 * 1000;
     private int                 receiveBufferSize = 16 * 1024;
@@ -43,14 +43,17 @@ public class MysqlConnector {
     // mysql connectinnId
     private long                connectionId      = -1;
     private AtomicBoolean       connected         = new AtomicBoolean(false);
-    
-    public static final int timeout = 3000; // 3s
+
+    public static final int     timeout           = 5 * 1000;                                     // 5s
 
     public MysqlConnector(){
     }
 
     public MysqlConnector(InetSocketAddress address, String username, String password){
-        this.address = address;
+        String addr = address.getHostString();
+        int port = address.getPort();
+        this.address = new InetSocketAddress(addr, port);
+
         this.username = username;
         this.password = password;
     }
@@ -336,4 +339,9 @@ public class MysqlConnector {
     public void setConnTimeout(int connTimeout) {
         this.connTimeout = connTimeout;
     }
+
+    public String getPassword() {
+        return password;
+    }
+
 }

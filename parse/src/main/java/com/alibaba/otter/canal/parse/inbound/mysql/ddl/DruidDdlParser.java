@@ -4,35 +4,39 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
-import com.alibaba.druid.sql.SQLUtils;
-import com.alibaba.druid.sql.ast.SQLExpr;
-import com.alibaba.druid.sql.ast.SQLStatement;
-import com.alibaba.druid.sql.ast.expr.SQLIdentifierExpr;
-import com.alibaba.druid.sql.ast.expr.SQLPropertyExpr;
-import com.alibaba.druid.sql.ast.statement.SQLAlterTableAddConstraint;
-import com.alibaba.druid.sql.ast.statement.SQLAlterTableAddIndex;
-import com.alibaba.druid.sql.ast.statement.SQLAlterTableDropConstraint;
-import com.alibaba.druid.sql.ast.statement.SQLAlterTableDropIndex;
-import com.alibaba.druid.sql.ast.statement.SQLAlterTableDropKey;
-import com.alibaba.druid.sql.ast.statement.SQLAlterTableItem;
-import com.alibaba.druid.sql.ast.statement.SQLAlterTableRename;
-import com.alibaba.druid.sql.ast.statement.SQLAlterTableStatement;
-import com.alibaba.druid.sql.ast.statement.SQLConstraint;
-import com.alibaba.druid.sql.ast.statement.SQLCreateIndexStatement;
-import com.alibaba.druid.sql.ast.statement.SQLCreateTableStatement;
-import com.alibaba.druid.sql.ast.statement.SQLDeleteStatement;
-import com.alibaba.druid.sql.ast.statement.SQLDropIndexStatement;
-import com.alibaba.druid.sql.ast.statement.SQLDropTableStatement;
-import com.alibaba.druid.sql.ast.statement.SQLExprTableSource;
-import com.alibaba.druid.sql.ast.statement.SQLInsertStatement;
-import com.alibaba.druid.sql.ast.statement.SQLTableSource;
-import com.alibaba.druid.sql.ast.statement.SQLTruncateStatement;
-import com.alibaba.druid.sql.ast.statement.SQLUnique;
-import com.alibaba.druid.sql.ast.statement.SQLUpdateStatement;
-import com.alibaba.druid.sql.dialect.mysql.ast.statement.MySqlRenameTableStatement;
-import com.alibaba.druid.sql.dialect.mysql.ast.statement.MySqlRenameTableStatement.Item;
-import com.alibaba.druid.sql.parser.ParserException;
-import com.alibaba.druid.util.JdbcConstants;
+import org.apache.commons.lang.StringUtils;
+
+import com.alibaba.fastsql.sql.SQLUtils;
+import com.alibaba.fastsql.sql.ast.SQLExpr;
+import com.alibaba.fastsql.sql.ast.SQLStatement;
+import com.alibaba.fastsql.sql.ast.expr.SQLIdentifierExpr;
+import com.alibaba.fastsql.sql.ast.expr.SQLPropertyExpr;
+import com.alibaba.fastsql.sql.ast.statement.SQLAlterTableAddConstraint;
+import com.alibaba.fastsql.sql.ast.statement.SQLAlterTableAddIndex;
+import com.alibaba.fastsql.sql.ast.statement.SQLAlterTableDropConstraint;
+import com.alibaba.fastsql.sql.ast.statement.SQLAlterTableDropIndex;
+import com.alibaba.fastsql.sql.ast.statement.SQLAlterTableDropKey;
+import com.alibaba.fastsql.sql.ast.statement.SQLAlterTableItem;
+import com.alibaba.fastsql.sql.ast.statement.SQLAlterTableRename;
+import com.alibaba.fastsql.sql.ast.statement.SQLAlterTableStatement;
+import com.alibaba.fastsql.sql.ast.statement.SQLConstraint;
+import com.alibaba.fastsql.sql.ast.statement.SQLCreateDatabaseStatement;
+import com.alibaba.fastsql.sql.ast.statement.SQLCreateIndexStatement;
+import com.alibaba.fastsql.sql.ast.statement.SQLCreateTableStatement;
+import com.alibaba.fastsql.sql.ast.statement.SQLDeleteStatement;
+import com.alibaba.fastsql.sql.ast.statement.SQLDropDatabaseStatement;
+import com.alibaba.fastsql.sql.ast.statement.SQLDropIndexStatement;
+import com.alibaba.fastsql.sql.ast.statement.SQLDropTableStatement;
+import com.alibaba.fastsql.sql.ast.statement.SQLExprTableSource;
+import com.alibaba.fastsql.sql.ast.statement.SQLInsertStatement;
+import com.alibaba.fastsql.sql.ast.statement.SQLTableSource;
+import com.alibaba.fastsql.sql.ast.statement.SQLTruncateStatement;
+import com.alibaba.fastsql.sql.ast.statement.SQLUnique;
+import com.alibaba.fastsql.sql.ast.statement.SQLUpdateStatement;
+import com.alibaba.fastsql.sql.dialect.mysql.ast.statement.MySqlRenameTableStatement;
+import com.alibaba.fastsql.sql.dialect.mysql.ast.statement.MySqlRenameTableStatement.Item;
+import com.alibaba.fastsql.sql.parser.ParserException;
+import com.alibaba.fastsql.util.JdbcConstants;
 import com.alibaba.otter.canal.protocol.CanalEntry.EventType;
 
 /**
@@ -157,6 +161,17 @@ public class DruidDdlParser {
                 processName(ddlResult, schmeaName, delete.getTableName(), false);
                 ddlResult.setType(EventType.DELETE);
                 ddlResults.add(ddlResult);
+            } else if (statement instanceof SQLCreateDatabaseStatement) {
+                DdlResult ddlResult = new DdlResult();
+                ddlResult.setType(EventType.QUERY);
+                // 只设置schema
+                processName(ddlResult, schmeaName, null, false);
+                ddlResults.add(ddlResult);
+            } else if (statement instanceof SQLDropDatabaseStatement) {
+                DdlResult ddlResult = new DdlResult();
+                ddlResult.setType(EventType.QUERY);
+                // 只设置schema
+                processName(ddlResult, schmeaName, null, false);
             }
         }
 
@@ -165,6 +180,9 @@ public class DruidDdlParser {
 
     private static void processName(DdlResult ddlResult, String schema, SQLExpr sqlName, boolean isOri) {
         if (sqlName == null) {
+            if (StringUtils.isNotBlank(schema)) {
+                ddlResult.setSchemaName(schema);
+            }
             return;
         }
 

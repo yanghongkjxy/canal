@@ -39,6 +39,7 @@ public class EntryEventSink extends AbstractCanalEventSink<List<CanalEntry.Entry
     protected long                 emptyTransctionThresold       = 8192;                                         // 超过1024个事务头，输出一个
     protected volatile long        lastEmptyTransactionTimestamp = 0L;
     protected AtomicLong           lastEmptyTransactionCount     = new AtomicLong(0L);
+    private AtomicLong             eventsSinkBlockingTime        = new AtomicLong(0L);
 
     public EntryEventSink(){
         addHandler(new HeartBeatEntryEventHandler());
@@ -92,11 +93,11 @@ public class EntryEventSink extends AbstractCanalEventSink<List<CanalEntry.Entry
         boolean hasHeartBeat = false;
         List<Event> events = new ArrayList<Event>();
         for (CanalEntry.Entry entry : entrys) {
-            Event event = new Event(new LogIdentity(remoteAddress, -1L), entry);
-            if (!doFilter(event)) {
+            if (!doFilter(entry)) {
                 continue;
             }
 
+            Event event = new Event(new LogIdentity(remoteAddress, -1L), entry);
             events.add(event);
             hasRowData |= (entry.getEntryType() == EntryType.ROWDATA);
             hasHeartBeat |= (entry.getEntryType() == EntryType.HEARTBEAT);
@@ -111,7 +112,7 @@ public class EntryEventSink extends AbstractCanalEventSink<List<CanalEntry.Entry
         } else {
             // 需要过滤的数据
             if (filterEmtryTransactionEntry && !CollectionUtils.isEmpty(events)) {
-                long currentTimestamp = events.get(0).getEntry().getHeader().getExecuteTime();
+                long currentTimestamp = events.get(0).getExecuteTime();
                 // 基于一定的策略控制，放过空的事务头和尾，便于及时更新数据库位点，表明工作正常
                 if (Math.abs(currentTimestamp - lastEmptyTransactionTimestamp) > emptyTransactionInterval
                     || lastEmptyTransactionCount.incrementAndGet() > emptyTransctionThresold) {
@@ -126,15 +127,15 @@ public class EntryEventSink extends AbstractCanalEventSink<List<CanalEntry.Entry
         }
     }
 
-    protected boolean doFilter(Event event) {
-        if (filter != null && event.getEntry().getEntryType() == EntryType.ROWDATA) {
-            String name = getSchemaNameAndTableName(event.getEntry());
+    protected boolean doFilter(CanalEntry.Entry entry) {
+        if (filter != null && entry.getEntryType() == EntryType.ROWDATA) {
+            String name = getSchemaNameAndTableName(entry);
             boolean need = filter.filter(name);
             if (!need) {
                 logger.debug("filter name[{}] entry : {}:{}",
                     name,
-                    event.getEntry().getHeader().getLogfileName(),
-                    event.getEntry().getHeader().getLogfileOffset());
+                    entry.getHeader().getLogfileName(),
+                    entry.getHeader().getLogfileOffset());
             }
 
             return need;
@@ -147,16 +148,27 @@ public class EntryEventSink extends AbstractCanalEventSink<List<CanalEntry.Entry
         for (CanalEventDownStreamHandler<List<Event>> handler : getHandlers()) {
             events = handler.before(events);
         }
-
+        long blockingStart = 0L;
         int fullTimes = 0;
         do {
             if (eventStore.tryPut(events)) {
+                if (fullTimes > 0) {
+                    eventsSinkBlockingTime.addAndGet(System.nanoTime() - blockingStart);
+                }
                 for (CanalEventDownStreamHandler<List<Event>> handler : getHandlers()) {
                     events = handler.after(events);
                 }
                 return true;
             } else {
+                if (fullTimes == 0) {
+                    blockingStart = System.nanoTime();
+                }
                 applyWait(++fullTimes);
+                if (fullTimes % 100 == 0) {
+                    long nextStart = System.nanoTime();
+                    eventsSinkBlockingTime.addAndGet(nextStart - blockingStart);
+                    blockingStart = nextStart;
+                }
             }
 
             for (CanalEventDownStreamHandler<List<Event>> handler : getHandlers()) {
@@ -200,6 +212,10 @@ public class EntryEventSink extends AbstractCanalEventSink<List<CanalEntry.Entry
 
     public void setEmptyTransctionThresold(long emptyTransctionThresold) {
         this.emptyTransctionThresold = emptyTransctionThresold;
+    }
+
+    public AtomicLong getEventsSinkBlockingTime() {
+        return eventsSinkBlockingTime;
     }
 
 }

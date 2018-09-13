@@ -1,26 +1,39 @@
 package com.alibaba.otter.canal.parse.inbound.mysql;
 
+import static com.alibaba.otter.canal.parse.inbound.mysql.dbsync.DirectLogFetcher.MASTER_HEARTBEAT_PERIOD_SECONDS;
+
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.net.SocketAddress;
 import java.nio.charset.Charset;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.apache.commons.lang.StringUtils;
+import org.apache.commons.lang.math.NumberUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.alibaba.otter.canal.parse.driver.mysql.MysqlConnector;
 import com.alibaba.otter.canal.parse.driver.mysql.MysqlQueryExecutor;
 import com.alibaba.otter.canal.parse.driver.mysql.MysqlUpdateExecutor;
+import com.alibaba.otter.canal.parse.driver.mysql.packets.GTIDSet;
 import com.alibaba.otter.canal.parse.driver.mysql.packets.HeaderPacket;
 import com.alibaba.otter.canal.parse.driver.mysql.packets.client.BinlogDumpCommandPacket;
+import com.alibaba.otter.canal.parse.driver.mysql.packets.client.BinlogDumpGTIDCommandPacket;
+import com.alibaba.otter.canal.parse.driver.mysql.packets.client.RegisterSlaveCommandPacket;
+import com.alibaba.otter.canal.parse.driver.mysql.packets.client.SemiAckCommandPacket;
+import com.alibaba.otter.canal.parse.driver.mysql.packets.server.ErrorPacket;
 import com.alibaba.otter.canal.parse.driver.mysql.packets.server.ResultSetPacket;
 import com.alibaba.otter.canal.parse.driver.mysql.utils.PacketManager;
 import com.alibaba.otter.canal.parse.exception.CanalParseException;
 import com.alibaba.otter.canal.parse.inbound.ErosaConnection;
+import com.alibaba.otter.canal.parse.inbound.MultiStageCoprocessor;
 import com.alibaba.otter.canal.parse.inbound.SinkFunction;
 import com.alibaba.otter.canal.parse.inbound.mysql.dbsync.DirectLogFetcher;
 import com.alibaba.otter.canal.parse.support.AuthenticationInfo;
+import com.taobao.tddl.dbsync.binlog.LogBuffer;
 import com.taobao.tddl.dbsync.binlog.LogContext;
 import com.taobao.tddl.dbsync.binlog.LogDecoder;
 import com.taobao.tddl.dbsync.binlog.LogEvent;
@@ -39,6 +52,8 @@ public class MysqlConnection implements ErosaConnection {
     private AuthenticationInfo  authInfo;
     protected int               connTimeout = 5 * 1000;                                      // 5秒
     protected int               soTimeout   = 60 * 60 * 1000;                                // 1小时
+    // dump binlog bytes, 暂不包括meta与TSDB
+    private AtomicLong          receivedBinlogBytes;
 
     public MysqlConnection(){
     }
@@ -114,6 +129,7 @@ public class MysqlConnection implements ErosaConnection {
         decoder.handle(LogEvent.XID_EVENT);
         LogContext context = new LogContext();
         while (fetcher.fetch()) {
+            accumulateReceivedBytes(fetcher.limit());
             LogEvent event = null;
             event = decoder.decode(fetcher, context);
 
@@ -129,12 +145,14 @@ public class MysqlConnection implements ErosaConnection {
 
     public void dump(String binlogfilename, Long binlogPosition, SinkFunction func) throws IOException {
         updateSettings();
+        sendRegisterSlave();
         sendBinlogDump(binlogfilename, binlogPosition);
         DirectLogFetcher fetcher = new DirectLogFetcher(connector.getReceiveBufferSize());
         fetcher.start(connector.getChannel());
         LogDecoder decoder = new LogDecoder(LogEvent.UNKNOWN_EVENT, LogEvent.ENUM_END_EVENT);
         LogContext context = new LogContext();
         while (fetcher.fetch()) {
+            accumulateReceivedBytes(fetcher.limit());
             LogEvent event = null;
             event = decoder.decode(fetcher, context);
 
@@ -145,6 +163,40 @@ public class MysqlConnection implements ErosaConnection {
             if (!func.sink(event)) {
                 break;
             }
+
+            if (event.getSemival() == 1) {
+                sendSemiAck(context.getLogPosition().getFileName(), context.getLogPosition().getPosition());
+            }
+        }
+    }
+
+    @Override
+    public void dump(GTIDSet gtidSet, SinkFunction func) throws IOException {
+        updateSettings();
+        sendBinlogDumpGTID(gtidSet);
+
+        DirectLogFetcher fetcher = new DirectLogFetcher(connector.getReceiveBufferSize());
+        try {
+            fetcher.start(connector.getChannel());
+            LogDecoder decoder = new LogDecoder(LogEvent.UNKNOWN_EVENT, LogEvent.ENUM_END_EVENT);
+            LogContext context = new LogContext();
+            // fix bug: #890 将gtid传输至context中，供decode使用
+            context.setGtidSet(gtidSet);
+            while (fetcher.fetch()) {
+                accumulateReceivedBytes(fetcher.limit());
+                LogEvent event = null;
+                event = decoder.decode(fetcher, context);
+
+                if (event == null) {
+                    throw new CanalParseException("parse failed");
+                }
+
+                if (!func.sink(event)) {
+                    break;
+                }
+            }
+        } finally {
+            fetcher.close();
         }
     }
 
@@ -152,15 +204,129 @@ public class MysqlConnection implements ErosaConnection {
         throw new NullPointerException("Not implement yet");
     }
 
+    @Override
+    public void dump(String binlogfilename, Long binlogPosition, MultiStageCoprocessor coprocessor) throws IOException {
+        updateSettings();
+        sendRegisterSlave();
+        sendBinlogDump(binlogfilename, binlogPosition);
+        ((MysqlMultiStageCoprocessor) coprocessor).setConnection(this);
+        DirectLogFetcher fetcher = new DirectLogFetcher(connector.getReceiveBufferSize());
+        try {
+            fetcher.start(connector.getChannel());
+            while (fetcher.fetch()) {
+                accumulateReceivedBytes(fetcher.limit());
+                LogBuffer buffer = fetcher.duplicate();
+                fetcher.consume(fetcher.limit());
+                if (!coprocessor.publish(buffer)) {
+                    break;
+                }
+            }
+        } finally {
+            fetcher.close();
+        }
+    }
+
+    @Override
+    public void dump(long timestamp, MultiStageCoprocessor coprocessor) throws IOException {
+        throw new NullPointerException("Not implement yet");
+    }
+
+    @Override
+    public void dump(GTIDSet gtidSet, MultiStageCoprocessor coprocessor) throws IOException {
+        updateSettings();
+        sendBinlogDumpGTID(gtidSet);
+
+        ((MysqlMultiStageCoprocessor) coprocessor).setConnection(this);
+        DirectLogFetcher fetcher = new DirectLogFetcher(connector.getReceiveBufferSize());
+        try {
+            fetcher.start(connector.getChannel());
+            while (fetcher.fetch()) {
+                accumulateReceivedBytes(fetcher.limit());
+                LogBuffer buffer = fetcher.duplicate();
+                fetcher.consume(fetcher.limit());
+                if (!coprocessor.publish(buffer)) {
+                    break;
+                }
+            }
+        } finally {
+            fetcher.close();
+        }
+    }
+
+    private void sendRegisterSlave() throws IOException {
+        RegisterSlaveCommandPacket cmd = new RegisterSlaveCommandPacket();
+        SocketAddress socketAddress = connector.getChannel().getLocalSocketAddress();
+        if (socketAddress == null || !(socketAddress instanceof InetSocketAddress)) {
+            return;
+        }
+
+        InetSocketAddress address = (InetSocketAddress) socketAddress;
+        String host = address.getHostString();
+        int port = address.getPort();
+        cmd.reportHost = host;
+        cmd.reportPort = port;
+        cmd.reportPasswd = authInfo.getPassword();
+        cmd.reportUser = authInfo.getUsername();
+        cmd.serverId = this.slaveId;
+        byte[] cmdBody = cmd.toBytes();
+
+        logger.info("Register slave {}", cmd);
+
+        HeaderPacket header = new HeaderPacket();
+        header.setPacketBodyLength(cmdBody.length);
+        header.setPacketSequenceNumber((byte) 0x00);
+        PacketManager.writePkg(connector.getChannel(), header.toBytes(), cmdBody);
+
+        header = PacketManager.readHeader(connector.getChannel(), 4);
+        byte[] body = PacketManager.readBytes(connector.getChannel(), header.getPacketBodyLength());
+        assert body != null;
+        if (body[0] < 0) {
+            if (body[0] == -1) {
+                ErrorPacket err = new ErrorPacket();
+                err.fromBytes(body);
+                throw new IOException("Error When doing Register slave:" + err.toString());
+            } else {
+                throw new IOException("unpexpected packet with field_count=" + body[0]);
+            }
+        }
+    }
+
     private void sendBinlogDump(String binlogfilename, Long binlogPosition) throws IOException {
         BinlogDumpCommandPacket binlogDumpCmd = new BinlogDumpCommandPacket();
         binlogDumpCmd.binlogFileName = binlogfilename;
         binlogDumpCmd.binlogPosition = binlogPosition;
-        // binlogDumpCmd.slaveServerId = this.slaveId;
         binlogDumpCmd.slaveServerId = this.slaveId;
         byte[] cmdBody = binlogDumpCmd.toBytes();
 
         logger.info("COM_BINLOG_DUMP with position:{}", binlogDumpCmd);
+        HeaderPacket binlogDumpHeader = new HeaderPacket();
+        binlogDumpHeader.setPacketBodyLength(cmdBody.length);
+        binlogDumpHeader.setPacketSequenceNumber((byte) 0x00);
+        PacketManager.writePkg(connector.getChannel(), binlogDumpHeader.toBytes(), cmdBody);
+        connector.setDumping(true);
+    }
+
+    public void sendSemiAck(String binlogfilename, Long binlogPosition) throws IOException {
+        SemiAckCommandPacket semiAckCmd = new SemiAckCommandPacket();
+        semiAckCmd.binlogFileName = binlogfilename;
+        semiAckCmd.binlogPosition = binlogPosition;
+
+        byte[] cmdBody = semiAckCmd.toBytes();
+
+        logger.info("SEMI ACK with position:{}", semiAckCmd);
+        HeaderPacket semiAckHeader = new HeaderPacket();
+        semiAckHeader.setPacketBodyLength(cmdBody.length);
+        semiAckHeader.setPacketSequenceNumber((byte) 0x00);
+        PacketManager.writePkg(connector.getChannel(), semiAckHeader.toBytes(), cmdBody);
+    }
+
+    private void sendBinlogDumpGTID(GTIDSet gtidSet) throws IOException {
+        BinlogDumpGTIDCommandPacket binlogDumpCmd = new BinlogDumpGTIDCommandPacket();
+        binlogDumpCmd.slaveServerId = this.slaveId;
+        binlogDumpCmd.gtidSet = gtidSet;
+        byte[] cmdBody = binlogDumpCmd.toBytes();
+
+        logger.info("COM_BINLOG_DUMP_GTID:{}", binlogDumpCmd);
         HeaderPacket binlogDumpHeader = new HeaderPacket();
         binlogDumpHeader.setPacketBodyLength(cmdBody.length);
         binlogDumpHeader.setPacketSequenceNumber((byte) 0x00);
@@ -178,6 +344,16 @@ public class MysqlConnection implements ErosaConnection {
         return connection;
     }
 
+    @Override
+    public long queryServerId() throws IOException {
+        ResultSetPacket resultSetPacket = query("show variables like 'server_id'");
+        List<String> fieldValues = resultSetPacket.getFieldValues();
+        if (fieldValues == null || fieldValues.size() != 2) {
+            return 0;
+        }
+        return NumberUtils.toLong(fieldValues.get(1));
+    }
+
     // ====================== help method ====================
 
     /**
@@ -188,7 +364,6 @@ public class MysqlConnection implements ErosaConnection {
      * <li>net_read_timeout</li>
      * </ol>
      * 
-     * @param channel
      * @throws IOException
      */
     private void updateSettings() throws IOException {
@@ -242,6 +417,22 @@ public class MysqlConnection implements ErosaConnection {
         } catch (Exception e) {
             logger.warn("update mariadb_slave_capability failed", e);
         }
+
+        /**
+         * MASTER_HEARTBEAT_PERIOD sets the interval in seconds between
+         * replication heartbeats. Whenever the master's binary log is updated
+         * with an event, the waiting period for the next heartbeat is reset.
+         * interval is a decimal value having the range 0 to 4294967 seconds and
+         * a resolution in milliseconds; the smallest nonzero value is 0.001.
+         * Heartbeats are sent by the master only if there are no unsent events
+         * in the binary log file for a period longer than interval.
+         */
+        try {
+            long periodNano = TimeUnit.SECONDS.toNanos(MASTER_HEARTBEAT_PERIOD_SECONDS);
+            update("SET @master_heartbeat_period=" + periodNano);
+        } catch (Exception e) {
+            logger.warn("update master_heartbeat_period failed", e);
+        }
     }
 
     /**
@@ -288,6 +479,12 @@ public class MysqlConnection implements ErosaConnection {
 
         if (binlogFormat == null) {
             throw new IllegalStateException("unexpected binlog image query result:" + rs.getFieldValues());
+        }
+    }
+
+    private void accumulateReceivedBytes(long x) {
+        if (receivedBinlogBytes != null) {
+            receivedBinlogBytes.addAndGet(x);
         }
     }
 
@@ -429,4 +626,9 @@ public class MysqlConnection implements ErosaConnection {
     public void setAuthInfo(AuthenticationInfo authInfo) {
         this.authInfo = authInfo;
     }
+
+    public void setReceivedBinlogBytes(AtomicLong receivedBinlogBytes) {
+        this.receivedBinlogBytes = receivedBinlogBytes;
+    }
+
 }

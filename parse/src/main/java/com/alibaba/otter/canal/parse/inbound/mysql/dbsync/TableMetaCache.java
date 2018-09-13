@@ -15,6 +15,8 @@ import com.alibaba.otter.canal.parse.inbound.TableMeta;
 import com.alibaba.otter.canal.parse.inbound.TableMeta.FieldMeta;
 import com.alibaba.otter.canal.parse.inbound.mysql.MysqlConnection;
 import com.alibaba.otter.canal.parse.inbound.mysql.ddl.DruidDdlParser;
+import com.alibaba.otter.canal.parse.inbound.mysql.tsdb.DatabaseTableMeta;
+import com.alibaba.otter.canal.parse.inbound.mysql.tsdb.MemoryTableMeta;
 import com.alibaba.otter.canal.parse.inbound.mysql.tsdb.TableMetaTSDB;
 import com.alibaba.otter.canal.protocol.position.EntryPosition;
 import com.google.common.cache.CacheBuilder;
@@ -53,7 +55,7 @@ public class TableMetaCache {
                 public TableMeta load(String name) throws Exception {
                     try {
                         return getTableMetaByDB(name);
-                    } catch (CanalParseException e) {
+                    } catch (Throwable e) {
                         // 尝试做一次retry操作
                         try {
                             connection.reconnect();
@@ -77,16 +79,38 @@ public class TableMetaCache {
     }
 
     private TableMeta getTableMetaByDB(String fullname) throws IOException {
-        ResultSetPacket packet = connection.query("desc " + fullname);
-        String[] names = StringUtils.split(fullname, "`.`");
-        String schema = names[0];
-        String table = names[1].substring(0, names[1].length());
-        return new TableMeta(schema, table, parserTableMeta(packet));
+        try {
+            ResultSetPacket packet = connection.query("show create table " + fullname);
+            String[] names = StringUtils.split(fullname, "`.`");
+            String schema = names[0];
+            String table = names[1].substring(0, names[1].length());
+            return new TableMeta(schema, table, parseTableMeta(schema, table, packet));
+        } catch (Throwable e) { // fallback to desc table
+            ResultSetPacket packet = connection.query("desc " + fullname);
+            String[] names = StringUtils.split(fullname, "`.`");
+            String schema = names[0];
+            String table = names[1].substring(0, names[1].length());
+            return new TableMeta(schema, table, parseTableMetaByDesc(packet));
+        }
     }
 
-    public static List<FieldMeta> parserTableMeta(ResultSetPacket packet) {
-        Map<String, Integer> nameMaps = new HashMap<String, Integer>(6, 1f);
+    public static List<FieldMeta> parseTableMeta(String schema, String table, ResultSetPacket packet) {
+        if (packet.getFieldValues().size() > 1) {
+            String createDDL = packet.getFieldValues().get(1);
+            MemoryTableMeta memoryTableMeta = new MemoryTableMeta();
+            memoryTableMeta.apply(DatabaseTableMeta.INIT_POSITION, schema, createDDL, null);
+            TableMeta tableMeta = memoryTableMeta.find(schema, table);
+            return tableMeta.getFields();
+        } else {
+            return new ArrayList<FieldMeta>();
+        }
+    }
 
+    /**
+     * 处理desc table的结果
+     */
+    public static List<FieldMeta> parseTableMetaByDesc(ResultSetPacket packet) {
+        Map<String, Integer> nameMaps = new HashMap<String, Integer>(6, 1f);
         int index = 0;
         for (FieldPacket fieldPacket : packet.getFieldDescriptors()) {
             nameMaps.put(fieldPacket.getOriginalName(), index++);
@@ -104,6 +128,7 @@ public class TableMetaCache {
                                                                                       * size),
                 "YES"));
             meta.setKey("PRI".equalsIgnoreCase(packet.getFieldValues().get(nameMaps.get(COLUMN_KEY) + i * size)));
+            meta.setUnique("UNI".equalsIgnoreCase(packet.getFieldValues().get(nameMaps.get(COLUMN_KEY) + i * size)));
             // 特殊处理引号
             meta.setDefaultValue(DruidDdlParser.unescapeQuotaName(packet.getFieldValues()
                 .get(nameMaps.get(COLUMN_DEFAULT) + i * size)));

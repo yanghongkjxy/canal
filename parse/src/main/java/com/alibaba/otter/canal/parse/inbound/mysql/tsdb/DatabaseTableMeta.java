@@ -18,9 +18,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
 
-import com.alibaba.druid.sql.repository.Schema;
 import com.alibaba.fastjson.JSON;
 import com.alibaba.fastjson.JSONObject;
+import com.alibaba.fastsql.sql.repository.Schema;
 import com.alibaba.otter.canal.filter.CanalEventFilter;
 import com.alibaba.otter.canal.parse.driver.mysql.packets.server.ResultSetPacket;
 import com.alibaba.otter.canal.parse.exception.CanalParseException;
@@ -44,19 +44,19 @@ import com.alibaba.otter.canal.protocol.position.EntryPosition;
  */
 public class DatabaseTableMeta implements TableMetaTSDB {
 
-    private static Logger              logger        = LoggerFactory.getLogger(DatabaseTableMeta.class);
-    private static Pattern             pattern       = Pattern.compile("Duplicate entry '.*' for key '*'");
-    private static Pattern             h2Pattern     = Pattern.compile("Unique index or primary key violation");
-    private static final EntryPosition INIT_POSITION = new EntryPosition("0", 0L, -2L, -1L);
-    private String                     destination;
-    private MemoryTableMeta            memoryTableMeta;
-    private MysqlConnection            connection;                                                              // 查询meta信息的链接
-    private CanalEventFilter           filter;
-    private CanalEventFilter           blackFilter;
-    private EntryPosition              lastPosition;
-    private ScheduledExecutorService   scheduler;
-    private MetaHistoryDAO             metaHistoryDAO;
-    private MetaSnapshotDAO            metaSnapshotDAO;
+    public static final EntryPosition INIT_POSITION = new EntryPosition("0", 0L, -2L, -1L);
+    private static Logger             logger        = LoggerFactory.getLogger(DatabaseTableMeta.class);
+    private static Pattern            pattern       = Pattern.compile("Duplicate entry '.*' for key '*'");
+    private static Pattern            h2Pattern     = Pattern.compile("Unique index or primary key violation");
+    private String                    destination;
+    private MemoryTableMeta           memoryTableMeta;
+    private MysqlConnection           connection;                                                              // 查询meta信息的链接
+    private CanalEventFilter          filter;
+    private CanalEventFilter          blackFilter;
+    private EntryPosition             lastPosition;
+    private ScheduledExecutorService  scheduler;
+    private MetaHistoryDAO            metaHistoryDAO;
+    private MetaSnapshotDAO           metaSnapshotDAO;
 
     public DatabaseTableMeta(){
 
@@ -70,7 +70,9 @@ public class DatabaseTableMeta implements TableMetaTSDB {
 
             @Override
             public Thread newThread(Runnable r) {
-                return new Thread(r, "[scheduler-table-meta-snapshot]");
+                Thread thread = new Thread(r, "[scheduler-table-meta-snapshot]");
+                thread.setDaemon(true);
+                return thread;
             }
         });
 
@@ -291,30 +293,35 @@ public class DatabaseTableMeta implements TableMetaTSDB {
         TableMeta tableMetaFromDB = new TableMeta();
         tableMetaFromDB.setSchema(schema);
         tableMetaFromDB.setTable(table);
+        String createDDL = null;
         try {
-            ResultSetPacket packet = connection.query("desc " + getFullName(schema, table));
-            tableMetaFromDB.setFields(TableMetaCache.parserTableMeta(packet));
-        } catch (IOException e) {
-            if (e.getMessage().contains("errorNumber=1146")) {
-                logger.error("table not exist in db , pls check :" + getFullName(schema, table) + " , mem : "
-                             + tableMetaFromMem);
-                return false;
+            ResultSetPacket packet = connection.query("show create table " + getFullName(schema, table));
+            if (packet.getFieldValues().size() > 1) {
+                createDDL = packet.getFieldValues().get(1);
+                tableMetaFromDB.setFields(TableMetaCache.parseTableMeta(schema, table, packet));
             }
-            throw new CanalParseException(e);
+        } catch (Throwable e) {
+            try {
+                // retry for broke pipe, see:
+                // https://github.com/alibaba/canal/issues/724
+                connection.reconnect();
+                ResultSetPacket packet = connection.query("show create table " + getFullName(schema, table));
+                if (packet.getFieldValues().size() > 1) {
+                    createDDL = packet.getFieldValues().get(1);
+                    tableMetaFromDB.setFields(TableMetaCache.parseTableMeta(schema, table, packet));
+                }
+            } catch (IOException e1) {
+                if (e.getMessage().contains("errorNumber=1146")) {
+                    logger.error("table not exist in db , pls check :" + getFullName(schema, table) + " , mem : "
+                                 + tableMetaFromMem);
+                    return false;
+                }
+                throw new CanalParseException(e);
+            }
         }
 
         boolean result = compareTableMeta(tableMetaFromMem, tableMetaFromDB);
         if (!result) {
-            String createDDL = null;
-            try {
-                ResultSetPacket packet = connection.query("show create table " + getFullName(schema, table));
-                if (packet.getFieldValues().size() > 1) {
-                    createDDL = packet.getFieldValues().get(1);
-                }
-            } catch (IOException e) {
-                // ignore
-            }
-
             logger.error("pls submit github issue, show create table ddl:" + createDDL + " , compare failed . \n db : "
                          + tableMetaFromDB + " \n mem : " + tableMetaFromMem);
         }
@@ -443,7 +450,10 @@ public class DatabaseTableMeta implements TableMetaTSDB {
                 return false;
             }
 
-            if (sourceField.isKey() != targetField.isKey()) {
+            // mysql会有一种处理,针对show create只有uk没有pk时，会在desc默认将uk当做pk
+            boolean isSourcePkOrUk = sourceField.isKey() || sourceField.isUnique();
+            boolean isTargetPkOrUk = targetField.isKey() || targetField.isUnique();
+            if (isSourcePkOrUk != isTargetPkOrUk) {
                 return false;
             }
         }
